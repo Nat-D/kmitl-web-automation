@@ -9,13 +9,25 @@ Two demos:
 
 Target site: https://quotes.toscrape.com — a sandbox built for scraping practice
 (its /js/ page renders with JavaScript; its /login accepts any credentials).
+
+Why the SYNC Playwright API in a worker thread (not the async API)?
+    Playwright spawns a driver **subprocess**. Under some server event loops —
+    Windows' SelectorEventLoop, or certain uvicorn/uvloop thread setups — the
+    async API's `loop.subprocess_exec` hits `_make_subprocess_transport` and
+    raises `NotImplementedError`. Running the *sync* API via `asyncio.to_thread`
+    dispatches it to a fresh worker thread that has **no running event loop**, so
+    Playwright creates its own and handles the subprocess correctly everywhere
+    (Linux/macOS/Windows, uvloop or not). This keeps the FastAPI handlers async
+    while the browser work runs off the request loop.
 """
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import trafilatura
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import async_playwright
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import sync_playwright
 
 from .config import Settings
 
@@ -37,17 +49,18 @@ def _launch_hint(exc: Exception) -> str:
     )
 
 
-async def _launch_chromium(p):
+def _launch_chromium(p):
     """Launch chromium, turning the cryptic 'Executable doesn't exist' / missing-lib
     failure into a clear, actionable BrowserUnavailable message."""
     try:
-        return await p.chromium.launch()
+        return p.chromium.launch()
     except PlaywrightError as exc:
         raise BrowserUnavailable(_launch_hint(exc)) from exc
 
 
-async def render_vs_fetch(url: str, settings: Settings) -> dict:
-    """Compare a plain GET (no JavaScript) with a real browser render."""
+# --- sync workers (run inside a worker thread via asyncio.to_thread) ------------
+
+def _render_vs_fetch_sync(url: str, settings: Settings) -> dict:
     # 1) plain HTTP GET — what search+fetch would see
     try:
         raw_html = httpx.get(url, timeout=settings.request_timeout,
@@ -57,16 +70,16 @@ async def render_vs_fetch(url: str, settings: Settings) -> dict:
     raw_text = (trafilatura.extract(raw_html) or "").strip()
 
     # 2) real browser — runs the page's JavaScript, then reads the DOM
-    async with async_playwright() as p:
-        browser = await _launch_chromium(p)
-        page = await browser.new_page(user_agent=_UA)
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        rendered_text = (await page.inner_text("body")).strip()
+    with sync_playwright() as p:
+        browser = _launch_chromium(p)
+        page = browser.new_page(user_agent=_UA)
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        rendered_text = page.inner_text("body").strip()
         try:
-            quote_count = await page.locator(".quote").count()   # quotes.toscrape specific
+            quote_count = page.locator(".quote").count()   # quotes.toscrape specific
         except Exception:  # noqa: BLE001
             quote_count = None
-        await browser.close()
+        browser.close()
 
     return {
         "url": url,
@@ -79,40 +92,39 @@ async def render_vs_fetch(url: str, settings: Settings) -> dict:
     }
 
 
-async def automate_login(username: str, password: str, settings: Settings) -> dict:
-    """Drive the goto → fill → fill → click → read flow, recording every ACT/OBS."""
+def _automate_login_sync(username: str, password: str, settings: Settings) -> dict:
     trace: list[dict] = []
 
     def log(act: str, obs: str) -> None:
         trace.append({"act": act, "obs": obs})
 
-    async with async_playwright() as p:
-        browser = await _launch_chromium(p)
-        page = await browser.new_page(user_agent=_UA)
+    with sync_playwright() as p:
+        browser = _launch_chromium(p)
+        page = browser.new_page(user_agent=_UA)
 
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
         log(f'goto("{LOGIN_URL}")', f"ok ({page.url})")
 
-        await page.fill("input#username", username)
+        page.fill("input#username", username)
         log('fill("input#username", …)', f"typed {username!r}")
 
-        await page.fill("input#password", password)
+        page.fill("input#password", password)
         log('fill("input#password", …)', "typed ••••••")
 
-        await page.click("input[type=submit]")
-        await page.wait_for_load_state("domcontentloaded")
+        page.click("input[type=submit]")
+        page.wait_for_load_state("domcontentloaded")
         log('click("input[type=submit]")', f"navigated -> {page.url}")
 
-        logged_in = await page.locator("a[href='/logout']").count() > 0
+        logged_in = page.locator("a[href='/logout']").count() > 0
         log('read("a[href=/logout]")', "Logout link present" if logged_in
             else "not logged in (no Logout link)")
 
         first_author = ""
-        if await page.locator(".quote .author").count():
-            first_author = await page.locator(".quote .author").first.inner_text()
+        if page.locator(".quote .author").count():
+            first_author = page.locator(".quote .author").first.inner_text()
             log('read(".quote .author")', f"{first_author!r}")
 
-        await browser.close()
+        browser.close()
 
     return {
         "logged_in": logged_in,
@@ -120,3 +132,15 @@ async def automate_login(username: str, password: str, settings: Settings) -> di
                    f"{first_author}.") if logged_in else "Login did not succeed.",
         "trace": trace,
     }
+
+
+# --- async wrappers the FastAPI handlers await ---------------------------------
+
+async def render_vs_fetch(url: str, settings: Settings) -> dict:
+    """Compare a plain GET (no JavaScript) with a real browser render."""
+    return await asyncio.to_thread(_render_vs_fetch_sync, url, settings)
+
+
+async def automate_login(username: str, password: str, settings: Settings) -> dict:
+    """Drive the goto → fill → fill → click → read flow, recording every ACT/OBS."""
+    return await asyncio.to_thread(_automate_login_sync, username, password, settings)

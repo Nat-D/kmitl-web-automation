@@ -118,6 +118,11 @@ extracted text, and answers with a citation your code recorded at fetch time.
   build** — pin an older Playwright (`uv pip install 'playwright==1.45'`) then re-run
   `uv run playwright install chromium`. On Linux you may also need
   `uv run playwright install-deps` (installs the shared libraries Chromium needs).
+- **`NotImplementedError` / `_make_subprocess_transport` when using the browser** — this
+  came from running Playwright's async API on a server event loop that can't spawn a
+  subprocess (Windows' selector loop, some uvicorn/uvloop setups). The app now runs
+  Playwright's **sync** API in a worker thread (`asyncio.to_thread`), which sidesteps it
+  on every platform — just pull the latest code.
 - **`tavily_key_set: false` / `llm_key_set: false`** — your `backend/.env` is missing or
   the backend wasn't restarted after editing it.
 - **Frontend can't reach the API** — make sure the backend is running on port 8000; the
